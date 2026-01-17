@@ -200,9 +200,9 @@
     Sheets:
       - Monomer_Matrix: Aggregated contact data per monomer unit
 
-================================================================================
-Data format
-================================================================================
+
+## Data format
+
 
 All data files are saved in XLSX (Excel) format for better compatibility with:
   - Microsoft Excel
@@ -213,11 +213,11 @@ All data files are saved in XLSX (Excel) format for better compatibility with:
 
 Each XLSX file may contain multiple sheets for organized data presentation.
 
-================================================================================
-Usage examples
-================================================================================
 
-Basic contact analysis:
+## Usage examples
+
+
+### Basic contact analysis:
   python crankpep_analysis.py -p protein.pdb -l peptide.pdb -c 4.0 -o results
 
 With DLG file analysis:
