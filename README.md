@@ -53,14 +53,14 @@
 ### Contact frequency data files (.xlsx format):
 ───────────────────────────────────────────────────────────────────────────────
 1. contacts_full_data.xlsx
-   Description: Complete contact frequency data with all protein-peptide residue pairs
-   Sheets:
-     - Contact_Data: Contains all contact pairs with counts and frequencies
-   Columns:
-     - Protein_Residue: Identifier of protein residue (ChainID_ResidueNumber_ResidueType)
-     - Peptide_Residue: Identifier of peptide residue
-     - Contact_Count: Number of frames where contact occurred
-     - Frequency: Contact frequency (0-1), normalized by total frames
+- Description: Complete contact frequency data with all protein-peptide residue pairs
+- Sheets:
+   - Contact_Data: Contains all contact pairs with counts and frequencies
+- Columns:
+-    Protein_Residue: Identifier of protein residue (ChainID_ResidueNumber_ResidueType)
+-    Peptide_Residue: Identifier of peptide residue
+-    Contact_Count: Number of frames where contact occurred
+-    Frequency: Contact frequency (0-1), normalized by total frames
 
 2. contacts_matrix.xlsx
    Description: Contact frequency matrix (protein residues × peptide residues)
