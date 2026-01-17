@@ -1,40 +1,40 @@
 # AutoDock-CrankPep-Analysis-Tool
 ### This directory contains the CrankPep Contact Analysis Tool, a python script for vizualization of protein-peptide interactions from AutoDock CrankPep docking results and data preparation for possible downstream processing
-## HOW THE SCRIPT WORKS
-### 1. STRUCTURE LOADING
+## How the script works
+### 1. Structure loading
    - Loads protein structure from PDBQT, PDB, or MOL2 format
    - Loads ligand/peptide structures with multiple models/conformations
 
-### 2. ATOM SELECTION
+### 2. Atom selection
    - Uses MDAnalysis selection strings to identify relevant atoms
    - Supports custom residue ranges (e.g., "resid 31:40")
    - Separates protein and peptide atoms for distance calculations
 
-### 3. CONTACT ANALYSIS
+### 3. Contact analysis
    - Iterates through all frames/models
    - Calculates pairwise distances between protein and peptide atoms
    - Identifies contacts below the specified cutoff distance
    - Counts unique residue-residue contacts per frame
    - Normalizes by total frames to get contact frequency
 
-### 4. RESIDUE IDENTIFICATION
+### 4. Residue identification
    - Generates unique identifiers: ChainID_ResidueNumber_ResidueType
    - Optionally sorts residues from N-terminus to C-terminus
    - Handles chain separations and multiple segments
 
-### 5. MATRIX GENERATION
+### 5. Matrix generation
    - Creates pivot table with protein residues as rows, peptides as columns
    - Values represent contact frequencies (0.0 to 1.0)
    - Generates row and column-normalized versions
    - Filters data based on user-specified threshold
 
-### 6. VISUALIZATION
+### 6. Vizualization
    - Generates heatmaps showing contact patterns
    - Creates bar plots for residue-level analysis
    - Produces histograms for energy distributions
    - Supports multiple image formats (PNG, PDF, SVG, JPG)
 
-### 7. DLG ANALYSIS (Optional)
+### 7. DLG file analysis (Optional)
    - Parses AutoDock CrankPep DLG (Docking Log) files
    - Extracts ADCP clustering data and affinities
    - Extracts OMM (OpenMM) rescoring results
@@ -42,15 +42,15 @@
    - Generates sorted energy visualizations
    - Provides comprehensive energy statistics
 
-### 8. MONOMER ANALYSIS (Optional)
+### 8. Monomer analysis (Optional)
    - For multimeric proteins, aggregates contacts per monomer unit
    - Sums contact frequencies across all monomer copies
    - Generates separate monomer interaction heatmap
 
 
-## OUTPUT FILE DESCRIPTIONS
+## Output file descriptions
 ### Note: term "frame" means a cluster of docked poses in the .pdb output file form CrankPep. That file contains a structures of representative clusters (such clasters are formed after AutoDock CrankPep own clusterization procedure)
-### CONTACT FREQUENCY DATA FILES (.xlsx format):
+### Contact frequency data files (.xlsx format):
 ───────────────────────────────────────────────────────────────────────────────
 1. contacts_full_data.xlsx
    Description: Complete contact frequency data with all protein-peptide residue pairs
@@ -86,7 +86,7 @@
      - Filtered_Matrix: Only residue pairs with frequency >= threshold value
    Note: Generated only if --threshold is specified
 
-BARPLOT DATA FILES (.xlsx format):
+### Barplot data files (.xlsx format):
 ───────────────────────────────────────────────────────────────────────────────
 
 6. contacts_peptide_barplot_data.xlsx
@@ -105,7 +105,7 @@ BARPLOT DATA FILES (.xlsx format):
      - residue: Protein residue identifier (N to C terminus order)
      - frequency: Total contact frequency for that residue
 
-DLG ANALYSIS FILES (.xlsx format) - Generated only with --dlg option:
+### DLG analysis files (.xlsx format) - !Generated *only** with --dlg option:
 ───────────────────────────────────────────────────────────────────────────────
 
 8. contacts_adcp_cluster_analysis.xlsx
@@ -144,7 +144,7 @@ DLG ANALYSIS FILES (.xlsx format) - Generated only with --dlg option:
       - cluster_num: Original cluster number
       - dE_interaction: E_Complex-E_rec-E_pep value
 
-VISUALIZATION FILES (Image format):
+### Vizualization files (Image format):
 ───────────────────────────────────────────────────────────────────────────────
 
 12. contacts_heatmap.png
@@ -192,7 +192,7 @@ VISUALIZATION FILES (Image format):
     Content: Summed interactions across all monomers
     Note: Generated only if --num-monomers > 1
 
-MONOMER FILES (.xlsx format) - Generated only with --num-monomers > 1:
+### Monomer files (.xlsx format) - !Generated *only** with --num-monomers > 1:
 ───────────────────────────────────────────────────────────────────────────────
 
 21. contacts_monomer_matrix.xlsx
@@ -201,7 +201,7 @@ MONOMER FILES (.xlsx format) - Generated only with --num-monomers > 1:
       - Monomer_Matrix: Aggregated contact data per monomer unit
 
 ================================================================================
-DATA FORMAT
+Data format
 ================================================================================
 
 All data files are saved in XLSX (Excel) format for better compatibility with:
@@ -214,7 +214,7 @@ All data files are saved in XLSX (Excel) format for better compatibility with:
 Each XLSX file may contain multiple sheets for organized data presentation.
 
 ================================================================================
-USAGE EXAMPLES
+Usage examples
 ================================================================================
 
 Basic contact analysis:
