@@ -41,7 +41,7 @@ Examples:
   python crankpep_analysis.py -p protein.pdbqt -l peptide_poses.pdb
   python crankpep_analysis.py -p protein.pdbqt -l peptide.pdb -c 5.0 -o my_contacts
   python crankpep_analysis.py --dlg docking.dlg -p protein.pdb -l ligand_poses.pdb
-  python crankpep_analysis.py -p protein.pdb -l peptide.pdb --num-monomers 4
+  python crankpep_analysis.py -p protein.pdb -l peptide.pdb --num-monomers 4 --aa-per-monomer 200
             """
 )
         
@@ -70,6 +70,8 @@ Examples:
                            help="Maximum number of models to analyze")
         parser.add_argument("--num-monomers", type=int, default=1,
                            help="Number of monomers in protein (default: 1)")
+        parser.add_argument("--aa-per-monomer", type=int, default=None,
+                           help="Number of amino acids per monomer (required for monomer analysis)")
         parser.add_argument("--sort-residues", action="store_true", default=True,
                            help="Sort residues N to C terminus (default: True)")
         
@@ -691,53 +693,177 @@ class MonomericInteractionPlotter:
     """Generates monomer interaction heatmaps."""
     
     @staticmethod
-    def create_heatmap(matrix, num_monomers, output_prefix, image_format, dpi=600, fig_width=12, fig_height=10, verbose=False):
-        """Create heatmap for peptide interactions with protein monomers."""
+    def create_heatmap(filtered_matrix, num_monomers, aa_per_monomer, output_prefix, 
+                      image_format, dpi=600, fig_width=12, fig_height=10, verbose=False):
+        """
+        Create heatmap for peptide interactions with protein monomers.
+        
+        Args:
+            filtered_matrix: Filtered contact matrix from threshold filtering
+            num_monomers: Number of monomers in the protein
+            aa_per_monomer: Number of amino acids per monomer
+            output_prefix: Output file prefix
+            image_format: Image format (png, pdf, etc.)
+            dpi: Image resolution
+            fig_width: Figure width
+            fig_height: Figure height
+            verbose: Print debug info
+        
+        Returns:
+            Path to saved heatmap file or None
+        """
         if num_monomers <= 1:
             if verbose:
                 print(f"Skipping monomer heatmap (monomers: {num_monomers})")
             return None
         
+        if aa_per_monomer is None:
+            print(f"ERROR: --aa-per-monomer is required for monomer analysis", file=sys.stderr)
+            return None
+        
+        if filtered_matrix is None or filtered_matrix.empty:
+            print(f"WARNING: Filtered matrix is empty, cannot create monomer heatmap", file=sys.stderr)
+            return None
+        
         try:
             if verbose:
-                print(f"Creating monomer heatmap for {num_monomers} monomers...")
+                print(f"\n=== Monomer Heatmap Creation ===")
+                print(f"Creating monomer heatmap for {num_monomers} monomers ({aa_per_monomer} AA each)")
+                print(f"Filtered matrix shape: {filtered_matrix.shape}")
             
-            protein_residues = matrix.index.tolist()
-            total_residues = len(protein_residues)
-            residues_per_monomer = total_residues // num_monomers
+            protein_residues = filtered_matrix.index.tolist()
+            peptide_residues = filtered_matrix.columns.tolist()
             
-            monomer_residues = protein_residues[:residues_per_monomer]
-            peptide_residues = matrix.columns.tolist()
+            # Extract residue numbers and names from identifiers
+            residue_data = []
             
-            monomer_matrix = pd.DataFrame(0.0, index=monomer_residues, columns=peptide_residues)
+            for res_id in protein_residues:
+                try:
+                    match = _RESIDUE_ID_PATTERN.match(res_id)
+                    if match:
+                        chain, resnum_str, resname = match.groups()
+                        resnum = int(resnum_str)
+                        residue_data.append({
+                            'resid': res_id,
+                            'resnum': resnum,
+                            'resname': resname,
+                            'chain': chain
+                        })
+                except (ValueError, AttributeError):
+                    pass
             
-            for i, residue in enumerate(monomer_residues):
-                for monomer_idx in range(num_monomers):
-                    full_index = i + (monomer_idx * residues_per_monomer)
-                    if full_index < total_residues:
-                        full_residue = protein_residues[full_index]
-                        for peptide_res in peptide_residues:
-                            if peptide_res in matrix.columns and full_residue in matrix.index:
-                                monomer_matrix.loc[residue, peptide_res] += matrix.loc[full_residue, peptide_res]
+            if not residue_data:
+                print(f"WARNING: Could not extract residue numbers", file=sys.stderr)
+                return None
             
+            # Sort by residue number
+            residue_data.sort(key=lambda x: x['resnum'])
+            min_resnum = residue_data[0]['resnum']
+            max_resnum = residue_data[-1]['resnum']
+            
+            if verbose:
+                print(f"Residue number range: {min_resnum} to {max_resnum}")
+                print(f"Expected range for {num_monomers} monomers × {aa_per_monomer} AA: "
+                      f"1 to {num_monomers * aa_per_monomer}")
+            
+            # Calculate monomer position for each residue
+            # Maps (pos_in_monomer, resname) -> list of residues
+            monomer_residue_map = {}
+            
+            for res in residue_data:
+                # Calculate position within monomer: residue number modulo aa_per_monomer
+                pos_in_monomer = res['resnum'] % aa_per_monomer
+                
+                # Handle case where resnum is exactly divisible by aa_per_monomer
+                if pos_in_monomer == 0:
+                    pos_in_monomer = aa_per_monomer
+                
+                # Calculate which monomer this residue belongs to (0-indexed)
+                monomer_idx = (res['resnum'] - 1) // aa_per_monomer
+                
+                if monomer_idx < num_monomers:
+                    # Create key based on position within monomer
+                    key = (pos_in_monomer, res['resname'])
+                    
+                    if key not in monomer_residue_map:
+                        monomer_residue_map[key] = []
+                    monomer_residue_map[key].append(res)
+                    
+                    if verbose and monomer_idx < 2:
+                        print(f"Residue {res['resid']} (#{res['resnum']}, {res['resname']}): "
+                              f"Monomer {monomer_idx}, Position {pos_in_monomer}")
+            
+            # Create monomer matrix labels: preserve original residue identifiers
+            monomer_labels = []
+            pos_to_label = {}  # Maps position to label
+            
+            for pos_in_monomer in sorted(set(k[0] for k in monomer_residue_map.keys())):
+                # Find the residue name for this position
+                matching_keys = [k for k in monomer_residue_map.keys() if k[0] == pos_in_monomer]
+                if matching_keys:
+                    resname = matching_keys[0][1]
+                    label = f"{resname}_{pos_in_monomer}"
+                    monomer_labels.append((pos_in_monomer, label))
+                    pos_to_label[pos_in_monomer] = label
+            
+            # Sort labels by position
+            monomer_labels.sort(key=lambda x: x[0])
+            label_list = [label for _, label in monomer_labels]
+            
+            # Create renumbered matrix
+            monomer_matrix = pd.DataFrame(0.0, 
+                                         index=label_list, 
+                                         columns=peptide_residues)
+            
+            # Sum contacts across all monomers, grouping by monomer position
+            for pos_in_monomer, label in monomer_labels:
+                # Sum all residues at this position across all monomers
+                matching_keys = [k for k in monomer_residue_map.keys() if k[0] == pos_in_monomer]
+                
+                for key in matching_keys:
+                    residues_at_pos = monomer_residue_map[key]
+                    
+                    for res in residues_at_pos:
+                        res_id = res['resid']
+                        
+                        if res_id in filtered_matrix.index:
+                            for pep_res in peptide_residues:
+                                if pep_res in filtered_matrix.columns:
+                                    monomer_matrix.loc[label, pep_res] += filtered_matrix.loc[res_id, pep_res]
+            
+            # Filter monomer matrix: keep only rows with at least one value > 0.15
+            threshold = 0.0
+            rows_to_keep = (monomer_matrix > threshold).any(axis=1)
+            monomer_matrix_filtered = monomer_matrix[rows_to_keep]
+            
+            if verbose:
+                print(f"Original monomer matrix shape: {monomer_matrix.shape}")
+                print(f"Filtered monomer matrix shape (values > {threshold}): {monomer_matrix_filtered.shape}")
+            
+            if monomer_matrix_filtered.empty:
+                print(f"WARNING: No residues with values > {threshold} found", file=sys.stderr)
+                return None
+            
+            # Create filtered plot with vmin and vmax
             plt.figure(figsize=(fig_width, fig_height))
             
-            if monomer_matrix.shape[0] > 50 or monomer_matrix.shape[1] > 50:
-                xtick_interval = max(1, monomer_matrix.shape[1] // 20)
-                ytick_interval = max(1, monomer_matrix.shape[0] // 20)
-                xtick_labels = [label if i % xtick_interval == 0 else '' for i, label in enumerate(monomer_matrix.columns)]
-                ytick_labels = [label if i % ytick_interval == 0 else '' for i, label in enumerate(monomer_matrix.index)]
+            if monomer_matrix_filtered.shape[0] > 50 or monomer_matrix_filtered.shape[1] > 50:
+                xtick_interval = max(1, monomer_matrix_filtered.shape[1] // 20)
+                ytick_interval = max(1, monomer_matrix_filtered.shape[0] // 10)
+                xtick_labels = [label if i % xtick_interval == 0 else '' for i, label in enumerate(monomer_matrix_filtered.columns)]
+                ytick_labels = [label if i % ytick_interval == 0 else '' for i, label in enumerate(monomer_matrix_filtered.index)]
             else:
-                xtick_labels = monomer_matrix.columns
-                ytick_labels = monomer_matrix.index
+                xtick_labels = monomer_matrix_filtered.columns
+                ytick_labels = monomer_matrix_filtered.index
             
-            sns.heatmap(monomer_matrix, cmap="YlOrRd", linewidths=0.2, linecolor="gray",
+            sns.heatmap(monomer_matrix_filtered, cmap="YlOrRd", linewidths=0.2, linecolor="gray",
                        cbar_kws={"label": "Total Contact Frequency (sum across monomers)"},
-                       square=False, xticklabels=xtick_labels, yticklabels=ytick_labels, vmax=0.5)
+                       square=False, xticklabels=xtick_labels, yticklabels=ytick_labels, 
+                       vmin=0.0, vmax=0.5)
             
-            plt.title(f"Peptide Interaction with Protein Monomer (sum across {num_monomers} monomers)")
+            plt.title(f"Peptide Interaction with Protein Monomer")
             plt.xlabel('Peptide Residue')
-            plt.ylabel('Monomer Residue')
+            plt.ylabel('Monomer Residue (Name_Position)')
             plt.xticks(rotation=45, ha='right')
             plt.yticks(rotation=0)
             plt.tight_layout()
@@ -746,15 +872,20 @@ class MonomericInteractionPlotter:
             plt.savefig(heatmap_file, dpi=dpi, bbox_inches='tight')
             plt.close()
             
-            monomer_matrix.to_csv(f"{output_prefix}_monomer_matrix.csv")
+            # Save filtered monomer matrix to xlsx
+            monomer_xlsx_file = f"{output_prefix}_monomer_matrix.xlsx"
+            monomer_matrix_filtered.to_excel(monomer_xlsx_file, sheet_name="Monomer_Matrix_Filtered", index=True, engine='openpyxl')
             
             if verbose:
                 print(f"Saved monomer heatmap to: {heatmap_file}")
+                print(f"Saved monomer matrix to: {monomer_xlsx_file}")
             
             return heatmap_file
             
         except Exception as e:
             print(f"WARNING: Could not create monomer heatmap: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             return None
 
 
@@ -1385,7 +1516,15 @@ MONOMER FILES (.xlsx format) - Generated only with --num-monomers > 1:
 21. contacts_monomer_matrix.xlsx
     Description: Contact frequency matrix summed across monomers
     Sheets:
-      - Monomer_Matrix: Aggregated contact data per monomer unit
+      - Monomer_Matrix: Aggregated contact data per monomer residue
+
+22. contacts_monomer_assignment.xlsx
+    Description: Residue to monomer assignment details
+    Sheets:
+      - Assignment: Mapping of residues to monomer indices
+    Columns:
+      - residue_id: Residue identifier
+      - monomer_index: Assigned monomer index
 
 ================================================================================
                                 HOW THE SCRIPT WORKS
@@ -1533,6 +1672,11 @@ def main():
         print("ERROR: Both --protein and --ligand are required", file=sys.stderr)
         sys.exit(1)
     
+    # Validate monomer parameters
+    if args.num_monomers > 1 and args.aa_per_monomer is None:
+        print("ERROR: --aa-per-monomer is required when --num-monomers > 1", file=sys.stderr)
+        sys.exit(1)
+    
     FileValidator.validate_files(args.protein, args.ligand, args.dlg)
     
     prot_sel = ResidueHandler.parse_residue_range(args.prot_sel)
@@ -1581,9 +1725,10 @@ def main():
             BarplotPlotter.plot_peptide(filtered_matrix, args.output, args.heatmap_format, args.dpi, args.horizontal, total_frames)
             BarplotPlotter.plot_protein(filtered_matrix, args.output, args.heatmap_format, args.dpi, args.horizontal, total_frames)
         
-        if args.num_monomers > 1:
+        if args.num_monomers > 1 and args.aa_per_monomer is not None:
             MonomericInteractionPlotter.create_heatmap(
-                matrix, args.num_monomers, args.output, args.heatmap_format, args.dpi, 12, 10, args.verbose
+                filtered_matrix, args.num_monomers, args.aa_per_monomer,
+                args.output, args.heatmap_format, args.dpi, 12, 10, args.verbose
             )
     
     # Create README file
