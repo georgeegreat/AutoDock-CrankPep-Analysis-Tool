@@ -22,89 +22,17 @@ from pathlib import Path
 import re
 from scipy.stats import gaussian_kde
 from datetime import datetime
+import tempfile
 
 # regex patterns for reuse
 _RESIDUE_ID_PATTERN = re.compile(r'^(\S+)_(\d+)_(\S+)$')
 _ENERGY_PATTERN = re.compile(r'bestEnergies\s*\[(.*?)\]')
-
-
-class ArgumentParser:
-    """Handles command-line argument parsing."""
-    
-    @staticmethod
-    def parse_arguments():
-        parser = argparse.ArgumentParser(
-            description="Calculate residue-residue contact frequencies between protein and peptide.",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""
-Examples:
-  python crankpep_analysis.py -p protein.pdbqt -l peptide_poses.pdb
-  python crankpep_analysis.py -p protein.pdbqt -l peptide.pdb -c 5.0 -o my_contacts
-  python crankpep_analysis.py --dlg docking.dlg -p protein.pdb -l ligand_poses.pdb
-  python crankpep_analysis.py -p protein.pdb -l peptide.pdb --num-monomers 4 --aa-per-monomer 200
-            """
+_OPENMM_ENERGY_PATTERN = re.compile(
+    r'USER: E_Complex\s*=\s*([\d\.\-]+)\s*;\s*E_Receptor\s*=\s*([\d\.\-]+)\s*;\s*E_Peptide\s*=\s*([\d\.\-]+)'
 )
-        
-        parser.add_argument("-p", "--protein", required=True,
-                           help="Input protein structure file (PDB, PDBQT, MOL2)")
-        parser.add_argument("-l", "--ligand",
-                           help="Input ligand/peptide file (PDB, PDBQT, MOL2 with multiple models)")
-        parser.add_argument("--dlg", help="Input AutoDock DLG file")
-        parser.add_argument("-c", "--cutoff", type=float, default=4.0,
-                           help="Distance cutoff in Angstroms (default: 4.0)")
-        parser.add_argument("-o", "--output", default="contacts",
-                           help="Base name for output files (default: 'contacts')")
-        parser.add_argument("--prot-sel", default="protein",
-                           help="Selection for protein atoms (MDAnalysis string or range like '31:40')")
-        parser.add_argument("--pep-sel", default="protein",
-                           help="Selection for peptide atoms (MDAnalysis string or range)")
-        parser.add_argument("--heatmap-format", choices=["png", "pdf", "svg", "jpg"], default="png",
-                           help="Format for heatmap (default: png)")
-        parser.add_argument("--dpi", type=int, default=600, help="DPI for images (default: 600)")
-        parser.add_argument("--no-plot", action="store_true", help="Skip heatmap generation")
-        parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
-        parser.add_argument("--horizontal", action="store_true", help="Horizontal heatmap")
-        parser.add_argument("--threshold", type=float, default=0.05,
-                           help="Threshold for filtered heatmap (default: 0.05)")
-        parser.add_argument("--max-models", type=int, default=None,
-                           help="Maximum number of models to analyze")
-        parser.add_argument("--num-monomers", type=int, default=1,
-                           help="Number of monomers in protein (default: 1)")
-        parser.add_argument("--aa-per-monomer", type=int, default=None,
-                           help="Number of amino acids per monomer (required for monomer analysis)")
-        parser.add_argument("--sort-residues", action="store_true", default=True,
-                           help="Sort residues N to C terminus (default: True)")
-        
-        return parser.parse_args()
-
-
-class FileValidator:
-    """Validates input files and manages file operations."""
-    
-    @staticmethod
-    def validate_files(protein_file, ligand_file=None, dlg_file=None):
-        """Check if input files exist."""
-        files = {'Protein': protein_file, 'Ligand': ligand_file, 'DLG': dlg_file}
-        for name, filepath in files.items():
-            if filepath and not os.path.exists(filepath):
-                print(f"ERROR: {name} file '{filepath}' not found!", file=sys.stderr)
-                sys.exit(1)
-    
-    @staticmethod
-    def create_output_directory(protein_file, ligand_file, dlg_file=None):
-        """Create and return output directory path."""
-        protein_stem = Path(protein_file).stem
-        ligand_stem = Path(ligand_file).stem
-        
-        if dlg_file:
-            dlg_stem = Path(dlg_file).stem
-            output_dir = f"analysis_{protein_stem}_and_{ligand_stem}_with_{dlg_stem}"
-        else:
-            output_dir = f"analysis_{protein_stem}_and_{ligand_stem}"
-        
-        os.makedirs(output_dir, exist_ok=True)
-        return output_dir
-
+_OPENMM_DE_PATTERN = re.compile(
+    r'USER:\s*dE_Interaction\s*=\s*([\d\.\-]+)'
+)
 
 class ResidueHandler:
     """Handles residue identification and manipulation."""
@@ -146,6 +74,600 @@ class ResidueHandler:
         
         sorted_info = sorted(residue_info, key=lambda x: (x[0], x[1]))
         return [item[3] for item in sorted_info]
+
+
+class OpenMMRescoredPDBAnalyzer:
+    """Analyzes OpenMM rescored PDB files with multiple models."""
+    
+    def __init__(self, openmm_pdb_file, cutoff, prot_sel, pep_sel,
+                 verbose=False, max_models=None, sort_residues=True,
+                 max_de_interaction=0.0):
+        """
+        Initialize OpenMM rescored PDB analyzer.
+        
+        Args:
+            openmm_pdb_file: Path to OpenMM rescored PDB file
+            cutoff: Distance cutoff for contacts (Å)
+            prot_sel: Protein atom selection string
+            pep_sel: Peptide atom selection string
+            verbose: Verbose output flag
+            max_models: Maximum number of models to analyze
+            sort_residues: Sort residues N to C terminus
+            max_de_interaction: Maximum dE_Interaction to include (default 0, only favorable)
+        """
+        self.openmm_pdb_file = openmm_pdb_file
+        self.cutoff = cutoff
+        self.prot_sel = prot_sel
+        self.pep_sel = pep_sel
+        self.verbose = verbose
+        self.max_models = max_models
+        self.sort_residues = sort_residues
+        self.max_de_interaction = max_de_interaction
+        self.models_data = []
+
+
+    def parse_openmm_pdb(self):
+        """Parse OpenMM rescored PDB file and extract models."""
+        if self.verbose:
+            print(f"Parsing OpenMM rescored PDB: {self.openmm_pdb_file}")
+        
+        with open(self.openmm_pdb_file, 'r') as f:
+            lines = f.readlines()
+        
+        current_model = None
+        current_protein_lines = []
+        current_peptide_lines = []
+        in_protein = False
+        in_peptide = False
+        model_count = 0
+        
+        for line in lines:
+            if line.startswith('MODEL'):
+                # Start new model
+                try:
+                    model_num = int(line.split()[1])
+                except (IndexError, ValueError):
+                    continue
+                    
+                current_model = {
+                    'model_num': model_num,
+                    'remarks': [],
+                    'protein_lines': [],
+                    'peptide_lines': [],
+                    'de_interaction': None,
+                    'e_complex': None,
+                    'e_receptor': None,
+                    'e_peptide': None
+                }
+                in_protein = False
+                in_peptide = False
+            
+            elif line.startswith('USER:'):
+                if current_model is not None:
+                    current_model['remarks'].append(line.strip())
+                    
+                    # Extract dE_Interaction
+                    if 'dE_Interaction' in line:
+                        match = _OPENMM_DE_PATTERN.search(line)
+                        if match:
+                            try:
+                                current_model['de_interaction'] = float(match.group(1))
+                            except ValueError:
+                                pass
+                    
+                    # Extract energies
+                    elif 'E_Complex =' in line:
+                        match = _OPENMM_ENERGY_PATTERN.search(line)
+                        if match:
+                            try:
+                                current_model['e_complex'] = float(match.group(1))
+                                current_model['e_receptor'] = float(match.group(2))
+                                current_model['e_peptide'] = float(match.group(3))
+                            except ValueError:
+                                pass
+            
+            elif line.startswith('REMARK'):
+                if current_model is not None:
+                    current_model['remarks'].append(line.strip())
+            
+            elif line.startswith('ATOM') or line.startswith('HETATM'):
+                if current_model is not None:
+                    # Determine if this is protein or peptide based on chain ID
+                    # Protein is chain 'd', peptide is chain 'Z'
+                    if len(line) >= 22:
+                        chain_id = line[21]
+                        if chain_id == 'd' or chain_id == 'D':
+                            current_model['protein_lines'].append(line)
+                            if not in_protein:
+                                in_protein = True
+                        elif chain_id == 'Z' or chain_id == 'z':
+                            current_model['peptide_lines'].append(line)
+                            if not in_peptide:
+                                in_peptide = True
+                        else:
+                            # Default: assume first chain is protein, second is peptide
+                            if not in_peptide:
+                                current_model['protein_lines'].append(line)
+                                in_protein = True
+                            else:
+                                current_model['peptide_lines'].append(line)
+            
+            elif line.startswith('TER'):
+                if current_model is not None:
+                    # Mark transition from protein to peptide
+                    if in_protein and not in_peptide:
+                        current_model['protein_lines'].append(line)
+                        in_peptide = True
+                        in_protein = False
+                    elif in_peptide:
+                        current_model['peptide_lines'].append(line)
+            
+            elif line.startswith('ENDMDL'):
+                if current_model and current_model['de_interaction'] is not None:
+                    # Check if model passes dE_Interaction filter
+                    if current_model['de_interaction'] <= self.max_de_interaction:
+                        # Add END to both PDB sections
+                        current_model['protein_lines'].append('END\n')
+                        current_model['peptide_lines'].append('END\n')
+                        
+                        # Only keep if we have both protein and peptide atoms
+                        if (len(current_model['protein_lines']) > 10 and 
+                            len(current_model['peptide_lines']) > 10):
+                            self.models_data.append(current_model)
+                            model_count += 1
+                            
+                            if self.verbose and model_count % 10 == 0:
+                                print(f"  Parsed {model_count} models...")
+                            
+                            if self.max_models and model_count >= self.max_models:
+                                break
+        
+        if self.verbose:
+            print(f"Total models parsed: {len(self.models_data)}")
+            if self.models_data:
+                print(f"Models with dE_Interaction <= {self.max_de_interaction}: {len(self.models_data)}")
+                # Show sample info
+                print(f"First model: {len(self.models_data[0]['protein_lines'])} protein lines, "
+                      f"{len(self.models_data[0]['peptide_lines'])} peptide lines")
+        
+        return self.models_data
+
+
+    def analyze_contacts(self):
+        """Analyze contacts across all OpenMM models."""
+        if not self.models_data:
+            self.parse_openmm_pdb()
+        
+        if not self.models_data:
+            print("\nERROR: No valid models found in OpenMM PDB file!", file=sys.stderr)
+            sys.exit(1)
+        
+        # Initialize counters
+        contact_counter = Counter()
+        protein_residue_counts = Counter()
+        peptide_residue_counts = Counter()
+        
+        # Track all residue identifiers for consistent ordering
+        all_prot_res_ids = set()
+        all_pep_res_ids = set()
+        
+        # Store temporary files to clean up later
+        temp_files = []
+        
+        try:
+            for model_idx, model in enumerate(self.models_data):
+                if self.verbose and model_idx % 10 == 0:
+                    print(f"Processing model {model_idx + 1}/{len(self.models_data)}...")
+                
+                # Create temporary PDB files
+                prot_temp = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+                pep_temp = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+                
+                prot_temp.writelines(model['protein_lines'])
+                pep_temp.writelines(model['peptide_lines'])
+                
+                prot_temp.close()
+                pep_temp.close()
+                
+                temp_files.extend([prot_temp.name, pep_temp.name])
+                
+                try:
+                    # Load structures
+                    u_prot = mda.Universe(prot_temp.name)
+                    u_pep = mda.Universe(pep_temp.name)
+                    
+                    # Select atoms
+                    try:
+                        prot_atoms = u_prot.select_atoms(self.prot_sel)
+                    except:
+                        prot_atoms = u_prot.select_atoms("all")
+                    
+                    try:
+                        pep_atoms = u_pep.select_atoms(self.pep_sel)
+                    except:
+                        pep_atoms = u_pep.select_atoms("all")
+                    
+                    # Get residue identifiers
+                    prot_res_ids = [ResidueHandler.get_residue_identifier(atom) for atom in prot_atoms]
+                    pep_res_ids = [ResidueHandler.get_residue_identifier(atom) for atom in pep_atoms]
+                    
+                    all_prot_res_ids.update(prot_res_ids)
+                    all_pep_res_ids.update(pep_res_ids)
+                    
+                    # Calculate contacts
+                    if len(prot_atoms) > 0 and len(pep_atoms) > 0:
+                        pairs = distances.capped_distance(
+                            prot_atoms.positions,
+                            pep_atoms.positions,
+                            max_cutoff=self.cutoff,
+                            return_distances=False)
+                        
+                        frame_contacts = set()
+                        protein_res_in_frame = set()
+                        peptide_res_in_frame = set()
+                        
+                        for i, j in pairs:
+                            prot_res = prot_res_ids[i]
+                            pep_res = pep_res_ids[j]
+                            frame_contacts.add((prot_res, pep_res))
+                            protein_res_in_frame.add(prot_res)
+                            peptide_res_in_frame.add(pep_res)
+                        
+                        # Update counters
+                        for pair in frame_contacts:
+                            contact_counter[pair] += 1
+                        
+                        for res in protein_res_in_frame:
+                            protein_residue_counts[res] += 1
+                        for res in peptide_res_in_frame:
+                            peptide_residue_counts[res] += 1
+                    
+                    # Clean up
+                    del u_prot
+                    del u_pep
+                    
+                except Exception as e:
+                    if self.verbose:
+                        print(f"WARNING: Failed to analyze model {model['model_num']}: {e}")
+                    continue
+            
+            # Convert sets to lists
+            prot_res_set = list(all_prot_res_ids)
+            pep_res_set = list(all_pep_res_ids)
+            
+            # Sort residues if requested
+            if self.sort_residues and self.models_data:
+                try:
+                    # Create temp universe for sorting
+                    temp_prot = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+                    temp_prot.writelines(self.models_data[0]['protein_lines'])
+                    temp_prot.close()
+                    
+                    temp_pep = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+                    temp_pep.writelines(self.models_data[0]['peptide_lines'])
+                    temp_pep.close()
+                    
+                    u_temp = mda.Universe(temp_prot.name)
+                    u_temp_pep = mda.Universe(temp_pep.name)
+                    
+                    prot_res_set = ResidueHandler.sort_residues_by_position(prot_res_set, u_temp)
+                    pep_res_set = ResidueHandler.sort_residues_by_position(pep_res_set, u_temp_pep)
+                    
+                    # Clean up
+                    del u_temp
+                    del u_temp_pep
+                    os.unlink(temp_prot.name)
+                    os.unlink(temp_pep.name)
+                    temp_files.extend([temp_prot.name, temp_pep.name])
+                    
+                except Exception as e:
+                    if self.verbose:
+                        print(f"WARNING: Could not sort residues: {e}")
+            
+            # Calculate frequencies
+            total_frames = len(self.models_data)
+            protein_res_freq = {res: count/total_frames for res, count in protein_residue_counts.items()}
+            peptide_res_freq = {res: count/total_frames for res, count in peptide_residue_counts.items()}
+            
+            # Create dummy atom groups for compatibility
+            class DummyAtomGroup:
+                def __init__(self):
+                    self.residues = []
+            
+            dummy_prot = DummyAtomGroup()
+            dummy_pep = DummyAtomGroup()
+            
+            if self.verbose:
+                print(f"Analysis complete: {len(contact_counter)} contact pairs found")
+            
+            return (contact_counter, dummy_prot, dummy_pep, total_frames, 
+                    prot_res_set, pep_res_set, protein_res_freq, peptide_res_freq)
+        
+        finally:
+            # Clean up temporary files
+            for temp_file in temp_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
+                except:
+                    pass
+
+
+    def get_energy_statistics(self):
+        """Extract and return energy statistics from models."""
+        if not self.models_data:
+            self.parse_openmm_pdb()
+        
+        energies = []
+        for model in self.models_data:
+            energies.append({
+                'model_num': model['model_num'],
+                'de_interaction': model['de_interaction'],
+                'e_complex': model['e_complex'],
+                'e_receptor': model['e_receptor'],
+                'e_peptide': model['e_peptide']
+            })
+        
+        df = pd.DataFrame(energies)
+        return df
+
+
+class OpenMMEnergyPlotter:
+    """Generates plots for OpenMM energy analysis."""
+    
+    @staticmethod
+    def plot_energy_distributions(energy_df, output_prefix, dpi=600, verbose=False):
+        """Create plots for OpenMM energy distributions."""
+        try:
+            if energy_df.empty:
+                return None
+            
+            # Create figure with subplots
+            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+            
+            # Plot 1: dE_Interaction distribution
+            de_interaction = energy_df['de_interaction'].dropna()
+            if len(de_interaction) > 0:
+                axes[0, 0].hist(de_interaction, bins=30, edgecolor='black', 
+                              alpha=0.7, color='skyblue', density=True)
+                axes[0, 0].axvline(0, color='red', linestyle='--', linewidth=2, 
+                                 label='dE = 0 (neutral)')
+                axes[0, 0].set_xlabel('dE_Interaction (favorable < 0)')
+                axes[0, 0].set_ylabel('Density')
+                axes[0, 0].set_title(f'dE_Interaction Distribution (N={len(de_interaction)})')
+                axes[0, 0].legend()
+                axes[0, 0].grid(True, alpha=0.3)
+                
+                # Add KDE if enough points
+                if len(de_interaction) > 1:
+                    kde = gaussian_kde(de_interaction)
+                    x_range = np.linspace(min(de_interaction), max(de_interaction), 1000)
+                    axes[0, 0].plot(x_range, kde(x_range), 'r-', linewidth=2, label='KDE')
+            
+            # Plot 2: E_Complex vs dE_Interaction scatter
+            if 'e_complex' in energy_df.columns:
+                e_complex = energy_df['e_complex'].dropna()
+                de_interaction = energy_df['de_interaction'].dropna()
+                
+                # Align indices
+                common_idx = e_complex.index.intersection(de_interaction.index)
+                if len(common_idx) > 0:
+                    scatter = axes[0, 1].scatter(e_complex.loc[common_idx], 
+                                                 de_interaction.loc[common_idx],
+                                                 c=np.arange(len(common_idx)), 
+                                                 cmap='viridis', alpha=0.6)
+                    axes[0, 1].set_xlabel('E_Complex')
+                    axes[0, 1].set_ylabel('dE_Interaction')
+                    axes[0, 1].set_title('E_Complex vs dE_Interaction')
+                    axes[0, 1].grid(True, alpha=0.3)
+                    plt.colorbar(scatter, ax=axes[0, 1], label='Model Index')
+            
+            # Plot 3: Energy component comparison
+            energy_cols = ['e_complex', 'e_receptor', 'e_peptide']
+            available_cols = [col for col in energy_cols if col in energy_df.columns]
+            
+            if len(available_cols) >= 2:
+                box_data = [energy_df[col].dropna() for col in available_cols]
+                # For matplotlib version compatibility
+                import matplotlib
+                matplotlib_version = matplotlib.__version__
+                if tuple(map(int, matplotlib_version.split('.')[:2])) >= (3, 9):
+                    bp = axes[1, 0].boxplot(box_data, tick_labels=available_cols, patch_artist=True)
+                else:
+                    bp = axes[1, 0].boxplot(box_data, labels=available_cols, patch_artist=True)
+                
+                # Color the boxes
+                colors = ['lightblue', 'lightgreen', 'lightcoral']
+                for patch, color in zip(bp['boxes'], colors):
+                    patch.set_facecolor(color)
+                
+                axes[1, 0].set_ylabel('Energy')
+                axes[1, 0].set_title('Energy Component Distribution')
+                axes[1, 0].grid(True, alpha=0.3, axis='y')
+            
+            # Plot 4: Model ranking by dE_Interaction
+            if len(de_interaction) > 0:
+                sorted_models = energy_df.sort_values('de_interaction').reset_index()
+                axes[1, 1].bar(range(len(sorted_models)), sorted_models['de_interaction'], 
+                             color='lightcoral', edgecolor='black', alpha=0.7)
+                axes[1, 1].set_xlabel('Model Rank (best to worst)')
+                axes[1, 1].set_ylabel('dE_Interaction')
+                axes[1, 1].set_title('Models Sorted by dE_Interaction')
+                axes[1, 1].grid(True, alpha=0.3, axis='y')
+                
+                # Add labels for top and bottom models
+                top_n = min(5, len(sorted_models))
+                for i in range(top_n):
+                    axes[1, 1].text(i, sorted_models.loc[i, 'de_interaction'], 
+                                  f"#{sorted_models.loc[i, 'model_num']}", 
+                                  ha='center', va='bottom', fontsize=8)
+                
+                if len(sorted_models) > top_n:
+                    for i in range(len(sorted_models)-top_n, len(sorted_models)):
+                        axes[1, 1].text(i, sorted_models.loc[i, 'de_interaction'], 
+                                      f"#{sorted_models.loc[i, 'model_num']}", 
+                                      ha='center', va='top', fontsize=8)
+            
+            plt.suptitle('OpenMM Rescored Energy Analysis', fontsize=16)
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            
+            output_file = f"{output_prefix}_openmm_energy_analysis.png"
+            plt.savefig(output_file, dpi=dpi, bbox_inches='tight')
+            plt.close()
+            
+            if verbose:
+                print(f"Saved OpenMM energy analysis to: {output_file}")
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"WARNING: Could not create OpenMM energy plots: {e}", file=sys.stderr)
+            return None
+    
+    @staticmethod
+    def plot_top_models_contacts(contact_counter, top_n, output_prefix, 
+                               prot_res_set, pep_res_set, total_frames,
+                               image_format='png', dpi=600, verbose=False):
+        """Create contact heatmaps for top N models by dE_Interaction."""
+        try:
+            from collections import defaultdict
+            
+            # Group contacts by frequency
+            contact_freq = defaultdict(list)
+            for (prot_res, pep_res), count in contact_counter.items():
+                freq = count / total_frames
+                contact_freq[freq].append((prot_res, pep_res))
+            
+            # Get top contacts by frequency
+            top_freqs = sorted(contact_freq.keys(), reverse=True)[:top_n]
+            top_contacts = []
+            for freq in top_freqs:
+                for prot_res, pep_res in contact_freq[freq]:
+                    top_contacts.append({
+                        'protein_residue': prot_res,
+                        'peptide_residue': pep_res,
+                        'frequency': freq,
+                        'count': int(freq * total_frames)
+                    })
+            
+            # Create DataFrame and save
+            top_df = pd.DataFrame(top_contacts)
+            if not top_df.empty:
+                top_df = top_df.sort_values('frequency', ascending=False)
+                output_file = f"{output_prefix}_top_{top_n}_contacts.xlsx"
+                top_df.to_excel(output_file, index=False, engine='openpyxl')
+                
+                if verbose:
+                    print(f"Saved top {top_n} contacts to: {output_file}")
+                
+                return output_file
+            
+            return None
+            
+        except Exception as e:
+            print(f"WARNING: Could not create top models contacts: {e}", file=sys.stderr)
+            return None
+
+
+class ArgumentParser:
+    """Handles command-line argument parsing."""
+    
+    @staticmethod
+    def parse_arguments():
+        parser = argparse.ArgumentParser(
+            description="Calculate residue-residue contact frequencies between protein and peptide.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Examples:
+  python crankpep_analysis.py -p protein.pdbqt -l peptide_poses.pdb
+  python crankpep_analysis.py -p protein.pdbqt -l peptide.pdb -c 5.0 -o my_contacts
+  python crankpep_analysis.py --dlg docking.dlg -p protein.pdb -l ligand_poses.pdb
+  python crankpep_analysis.py --openmm-rescored-pdb openmm_results.pdb -c 4.0 -o openmm_analysis
+  python crankpep_analysis.py --openmm-rescored-pdb openmm_results.pdb --num-monomers 4 --aa-per-monomer 200
+            """
+        )
+        
+        # Input file groups (mutually exclusive)
+        input_group = parser.add_mutually_exclusive_group(required=True)
+        input_group.add_argument("-p", "--protein", 
+                               help="Input protein structure file (PDB, PDBQT, MOL2)")
+        input_group.add_argument("--openmm-rescored-pdb", 
+                               help="Input OpenMM rescored PDB file with multiple models")
+        
+        # Ligand file (required only with --protein)
+        parser.add_argument("-l", "--ligand",
+                           help="Input ligand/peptide file (PDB, PDBQT, MOL2 with multiple models)")
+        
+        # DLG file
+        parser.add_argument("--dlg", help="Input AutoDock DLG file")
+        
+        # OpenMM specific options
+        parser.add_argument("--openmm-max-de", type=float, default=0.0,
+                           help="Maximum dE_Interaction to include (default: 0.0, only favorable)")
+        parser.add_argument("--openmm-top-models", type=int, default=10,
+                           help="Number of top models to analyze separately (default: 10)")
+        
+        # Common options (available for both modes)
+        parser.add_argument("-c", "--cutoff", type=float, default=4.0,
+                           help="Distance cutoff in Angstroms (default: 4.0)")
+        parser.add_argument("-o", "--output", default="contacts",
+                           help="Base name for output files (default: 'contacts')")
+        parser.add_argument("--prot-sel", default="all",  # Changed from "protein" to "all"
+                           help="Selection for protein atoms (MDAnalysis string or range like '31:40')")
+        parser.add_argument("--pep-sel", default="all",   # Changed from "protein" to "all"
+                           help="Selection for peptide atoms (MDAnalysis string or range)")
+        parser.add_argument("--heatmap-format", choices=["png", "pdf", "svg", "jpg"], default="png",
+                           help="Format for heatmap (default: png)")
+        parser.add_argument("--dpi", type=int, default=600, help="DPI for images (default: 600)")
+        parser.add_argument("--no-plot", action="store_true", help="Skip heatmap generation")
+        parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+        parser.add_argument("--horizontal", action="store_true", help="Horizontal heatmap")
+        parser.add_argument("--threshold", type=float, default=0.05,
+                           help="Threshold for filtered heatmap (default: 0.05)")
+        parser.add_argument("--max-models", type=int, default=None,
+                           help="Maximum number of models to analyze")
+        parser.add_argument("--num-monomers", type=int, default=1,
+                           help="Number of monomers in protein (default: 1)")
+        parser.add_argument("--aa-per-monomer", type=int, default=None,
+                           help="Number of amino acids per monomer (required for monomer analysis)")
+        parser.add_argument("--sort-residues", action="store_true", default=True,
+                           help="Sort residues N to C terminus (default: True)")
+        
+        return parser.parse_args()
+
+
+class FileValidator:
+    """Validates input files and manages file operations."""
+    
+    @staticmethod
+    def validate_files(protein_file=None, ligand_file=None, dlg_file=None, openmm_file=None):
+        """Check if input files exist."""
+        files = {'Protein': protein_file, 'Ligand': ligand_file, 
+                'DLG': dlg_file, 'OpenMM PDB': openmm_file}
+        for name, filepath in files.items():
+            if filepath and not os.path.exists(filepath):
+                print(f"ERROR: {name} file '{filepath}' not found!", file=sys.stderr)
+                sys.exit(1)
+    
+    @staticmethod
+    def create_output_directory(protein_file=None, ligand_file=None, 
+                              dlg_file=None, openmm_file=None):
+        """Create and return output directory path."""
+        if openmm_file:
+            openmm_stem = Path(openmm_file).stem
+            output_dir = f"analysis_openmm_{openmm_stem}"
+        elif dlg_file:
+            protein_stem = Path(protein_file).stem
+            ligand_stem = Path(ligand_file).stem
+            dlg_stem = Path(dlg_file).stem
+            output_dir = f"analysis_{protein_stem}_and_{ligand_stem}_with_{dlg_stem}"
+        else:
+            protein_stem = Path(protein_file).stem
+            ligand_stem = Path(ligand_file).stem
+            output_dir = f"analysis_{protein_stem}_and_{ligand_stem}"
+        
+        os.makedirs(output_dir, exist_ok=True)
+        return output_dir
 
 
 class DLGParser:
@@ -532,8 +1054,9 @@ class HeatmapPlotter:
             filtered_file = HeatmapPlotter._create_filtered(
                 filtered_matrix, output_prefix, image_format, dpi, threshold, horizontal, fig_width
             )
-            filtered_matrix.to_csv(f"{output_prefix}_filtered_matrix.csv")
-        
+            filtered_matrix_xlsx_file = f"{output_prefix}_filtered_matrix.xlsx"
+            filtered_matrix.to_excel(filtered_matrix_xlsx_file, sheet_name="Filtered Matrix", index=True, engine='openpyxl')
+
         return heatmap_file, filtered_file, filtered_matrix
     
     @staticmethod
@@ -1304,6 +1827,9 @@ class SummaryPrinter:
             print(f"Protein file:          {args.protein}")
         if args.ligand:
             print(f"Ligand file:           {args.ligand}")
+        if hasattr(args, 'openmm_rescored_pdb') and args.openmm_rescored_pdb:
+            print(f"OpenMM PDB file:       {args.openmm_rescored_pdb}")
+            print(f"Max dE_Interaction:    {args.openmm_max_de}")
         print(f"Distance cutoff:       {args.cutoff} Å")
         print(f"Total frames analyzed: {total_frames}")
         print(f"Unique residue pairs:  {len(df)}")
@@ -1331,11 +1857,42 @@ class SummaryPrinter:
                 print(f"  Histogram:           {histogram_file}")
             if cluster_analysis_file:
                 print(f"  Cluster analysis:    {cluster_analysis_file}")
+        if hasattr(args, 'openmm_rescored_pdb') and args.openmm_rescored_pdb:
+            print(f"  OpenMM energy analysis: {output_prefix}_openmm_energy_analysis.png")
         print("="*60)
 
 
 def create_readme_file(output_dir, analysis_date, args, total_frames, num_contacts):
     """Create a README.txt file."""
+    # Add OpenMM specific section if applicable
+    if hasattr(args, 'openmm_rescored_pdb') and args.openmm_rescored_pdb:
+        openmm_section = f"""
+================================================================================
+                            OPENMM RESCORED ANALYSIS
+================================================================================
+
+This analysis was performed on OpenMM rescored PDB file: {args.openmm_rescored_pdb}
+
+OPENMM SPECIFIC PARAMETERS:
+  - Maximum dE_Interaction: {args.openmm_max_de}
+  - Top models analyzed separately: {getattr(args, 'openmm_top_models', 10)}
+  - Models analyzed: {total_frames} (filtered by dE_Interaction ≤ {args.openmm_max_de})
+
+ENERGY TERMS EXTRACTED:
+  - E_Complex: Total energy of the complex
+  - E_Receptor: Energy of the protein receptor
+  - E_Peptide: Energy of the peptide ligand
+  - dE_Interaction: Interaction energy (E_Complex - E_Receptor - E_Peptide)
+
+NOTE: Only models with favorable interactions (dE_Interaction ≤ {args.openmm_max_de}) 
+were included in the contact analysis.
+
+================================================================================
+"""
+    else:
+        openmm_section = ""
+    
+    # Insert OpenMM section in appropriate place in README
     readme_content = f"""================================================================================
                           CRANKPEP ANALYSIS REPORT
                             CrankPep Analysis Tool
@@ -1353,9 +1910,10 @@ a comprehensive analysis python script for protein-peptide interactions from Aut
 CrankPep docking results.
 
 ANALYSIS PARAMETERS:
-  - Protein File: {args.protein}
-  - Ligand File: {args.ligand}
-  - DLG File: {args.dlg if args.dlg else 'Not provided'}
+  - Protein File: {args.protein if hasattr(args, 'protein') else 'N/A (OpenMM mode)'}
+  - Ligand File: {args.ligand if hasattr(args, 'ligand') else 'N/A (OpenMM mode)'}
+  - DLG File: {args.dlg if hasattr(args, 'dlg') and args.dlg else 'Not provided'}
+  - OpenMM Rescored PDB: {args.openmm_rescored_pdb if hasattr(args, 'openmm_rescored_pdb') else 'Not provided'}
   - Distance Cutoff: {args.cutoff} Å
   - Total Frames Analyzed: {total_frames}
   - Unique Contact Pairs: {num_contacts}
@@ -1363,6 +1921,7 @@ ANALYSIS PARAMETERS:
   - Horizontal Heatmap: {'Yes' if args.horizontal else 'No'}
   - Threshold: {args.threshold}
 
+{openmm_section}
 ================================================================================
                             OUTPUT FILE DESCRIPTIONS
 ================================================================================
@@ -1403,11 +1962,50 @@ CONTACT FREQUENCY DATA FILES (.xlsx format):
    Sheets:
      - Filtered_Matrix: Only residue pairs with frequency >= threshold value
    Note: Generated only if --threshold is specified
+"""
+    
+    # Add OpenMM specific file descriptions
+    if hasattr(args, 'openmm_rescored_pdb') and args.openmm_rescored_pdb:
+        readme_content += f"""
+OPENMM ENERGY FILES (.xlsx format) - Generated only with --openmm-rescored-pdb:
+───────────────────────────────────────────────────────────────────────────────
 
+6. contacts_openmm_energies.xlsx
+   Description: Energy values extracted from OpenMM rescored models
+   Sheets:
+     - OpenMM_Energies: Energy data for each model
+   Columns:
+     - model_num: Model number from OpenMM PDB
+     - de_interaction: dE_Interaction energy (E_Complex - E_Receptor - E_Peptide)
+     - e_complex: Total energy of the complex
+     - e_receptor: Energy of protein receptor
+     - e_peptide: Energy of peptide ligand
+
+7. contacts_openmm_energy_analysis.png
+   Description: Four-panel energy analysis visualization
+   Content:
+     - Panel 1: dE_Interaction distribution histogram
+     - Panel 2: E_Complex vs dE_Interaction scatter plot
+     - Panel 3: Energy component comparison box plot
+     - Panel 4: Models ranked by dE_Interaction (best to worst)
+
+8. contacts_top_{getattr(args, 'openmm_top_models', 10)}_contacts.xlsx
+   Description: Top {getattr(args, 'openmm_top_models', 10)} contact pairs by frequency
+   Sheets:
+     - Top_Contacts: Highest frequency contact pairs
+   Columns:
+     - protein_residue: Protein residue identifier
+     - peptide_residue: Peptide residue identifier
+     - frequency: Contact frequency (0-1)
+     - count: Absolute contact count
+"""
+    
+    # Continue with rest of README
+    readme_content += f"""
 BARPLOT DATA FILES (.xlsx format):
 ───────────────────────────────────────────────────────────────────────────────
 
-6. contacts_peptide_barplot_data.xlsx
+9. contacts_peptide_barplot_data.xlsx
    Description: Summed contact frequencies for each peptide residue
    Sheets:
      - Peptide_Barplot: Aggregate contact data per peptide residue
@@ -1415,166 +2013,110 @@ BARPLOT DATA FILES (.xlsx format):
      - residue: Peptide residue identifier
      - frequency: Total contact frequency for that residue
 
-7. contacts_protein_barplot_data.xlsx
-   Description: Summed contact frequencies for each protein residue
-   Sheets:
-     - Protein_Barplot: Aggregate contact data per protein residue
-   Columns:
-     - residue: Protein residue identifier (N to C terminus order)
-     - frequency: Total contact frequency for that residue
+10. contacts_protein_barplot_data.xlsx
+    Description: Summed contact frequencies for each protein residue
+    Sheets:
+      - Protein_Barplot: Aggregate contact data per protein residue
+    Columns:
+      - residue: Protein residue identifier (N to C terminus order)
+      - frequency: Total contact frequency for that residue
 
 DLG ANALYSIS FILES (.xlsx format) - Generated only with --dlg option:
 ───────────────────────────────────────────────────────────────────────────────
 
-8. contacts_adcp_cluster_analysis.xlsx
-   Description: AutoDock CrankPep cluster analysis
-   Sheets:
-     - ADCP_Clusters: ADCP cluster information sorted by affinity
-   Columns:
-     - cluster_num: Cluster number (1-100)
-     - affinity: Binding affinity (kcal/mol)
-     - cluster_size: Number of poses in cluster
-
-9. contacts_omm_cluster_analysis.xlsx
-   Description: OpenMM energy rescoring results
-   Sheets:
-     - OMM_Clusters: OMM rescored cluster data
-   Columns:
-     - cluster_num: ADCP cluster number
-     - interaction_energy: E_Complex-E_Receptor
-     - dE_interaction: E_Complex-E_rec-E_pep
-
-10. contacts_sorted_omm_interaction_energy.xlsx
-    Description: OMM interaction energy sorted from best to worst
+11. contacts_adcp_cluster_analysis.xlsx
+    Description: AutoDock CrankPep cluster analysis
     Sheets:
-      - Sorted_Energy: Clusters sorted by interaction energy
+      - ADCP_Clusters: ADCP cluster information sorted by affinity
     Columns:
-      - cluster: Cluster label (C1, C2, etc.)
-      - cluster_num: Original cluster number
-      - interaction_energy: E_Complex-E_Receptor value
+      - cluster_num: Cluster number (1-100)
+      - affinity: Binding affinity (kcal/mol)
+      - cluster_size: Number of poses in cluster
 
-11. contacts_sorted_omm_dE_interaction.xlsx
-    Description: OMM dE_interaction sorted from best to worst
+12. contacts_omm_cluster_analysis.xlsx
+    Description: OpenMM energy rescoring results
     Sheets:
-      - Sorted_dE: Clusters sorted by dE_interaction
+      - OMM_Clusters: OMM rescored cluster data
     Columns:
-      - cluster: Cluster label (C1, C2, etc.)
-      - cluster_num: Original cluster number
-      - dE_interaction: E_Complex-E_rec-E_pep value
+      - cluster_num: ADCP cluster number
+      - interaction_energy: E_Complex-E_Receptor
+      - dE_interaction: E_Complex-E_rec-E_pep
 
 VISUALIZATION FILES (Image format):
 ───────────────────────────────────────────────────────────────────────────────
 
-12. contacts_heatmap.{args.heatmap_format}
+13. contacts_heatmap.{args.heatmap_format}
     Description: Full contact frequency heatmap
     Content: Visual representation of all protein-peptide contacts
     Color: Yellow (0.0 frequency) → Red (1.0 frequency)
 
-13. contacts_filtered_heatmap.{args.heatmap_format}
+14. contacts_filtered_heatmap.{args.heatmap_format}
     Description: Filtered contact heatmap (contacts above threshold only)
     Content: Shows only significant contacts
 
-14. contacts_peptide_barplot.{args.heatmap_format}
+15. contacts_peptide_barplot.{args.heatmap_format}
     Description: Bar plot of peptide residue interaction strength
     Content: Total contacts per peptide residue
 
-15. contacts_protein_barplot.{args.heatmap_format}
+16. contacts_protein_barplot.{args.heatmap_format}
     Description: Bar plot of protein residue interaction strength
     Content: Total contacts per protein residue (N to C terminus order)
-
-16. contacts_best_energies_histogram.png
-    Description: Distribution of raw bestEnergies from docking
-    Content: Histogram with KDE, mean, and median lines
-    Note: Generated only with --dlg option
-
-17. contacts_cluster_analysis.png
-    Description: Three-panel cluster analysis visualization
-    Content:
-      - Panel 1: ADCP affinity vs cluster size
-      - Panel 2: OMM interaction energy by cluster
-      - Panel 3: OMM dE_interaction by cluster
-    Note: Generated only with --dlg option
-
-18. contacts_sorted_omm_interaction_energy.png
-    Description: OMM interaction energy sorted visualization
-    Content: Clusters sorted from best to worst energy
-    Note: Generated only with --dlg option
-
-19. contacts_sorted_omm_dE_interaction.png
-    Description: OMM dE_interaction sorted visualization
-    Content: Clusters sorted from best to worst dE_interaction
-    Note: Generated only with --dlg option
-
-20. contacts_monomer_heatmap.{args.heatmap_format}
-    Description: Monomer interaction heatmap
-    Content: Summed interactions across all monomers
-    Note: Generated only if --num-monomers > 1
 
 MONOMER FILES (.xlsx format) - Generated only with --num-monomers > 1:
 ───────────────────────────────────────────────────────────────────────────────
 
-21. contacts_monomer_matrix.xlsx
+17. contacts_monomer_matrix.xlsx
     Description: Contact frequency matrix summed across monomers
     Sheets:
       - Monomer_Matrix: Aggregated contact data per monomer residue
-
-22. contacts_monomer_assignment.xlsx
-    Description: Residue to monomer assignment details
-    Sheets:
-      - Assignment: Mapping of residues to monomer indices
-    Columns:
-      - residue_id: Residue identifier
-      - monomer_index: Assigned monomer index
 
 ================================================================================
                                 HOW THE SCRIPT WORKS
 ================================================================================
 
 1. STRUCTURE LOADING
-   - Loads protein structure from PDBQT, PDB, or MOL2 format
-   - Loads ligand/peptide structures with multiple models/conformations
+   - For regular mode: Loads protein and ligand structures separately
+   - For OpenMM mode: Parses multi-model PDB with embedded energies
+   - Uses MDAnalysis for structure parsing and manipulation
 
-2. ATOM SELECTION
+2. ENERGY FILTERING (OpenMM mode only)
+   - Extracts dE_Interaction from USER remarks
+   - Filters out models with unfavorable interactions (dE_Interaction > {args.openmm_max_de if hasattr(args, 'openmm_max_de') else 'N/A'})
+   - Only analyzes models with favorable or neutral interactions
+
+3. ATOM SELECTION
    - Uses MDAnalysis selection strings to identify relevant atoms
    - Supports custom residue ranges (e.g., "resid 31:40")
    - Separates protein and peptide atoms for distance calculations
 
-3. CONTACT ANALYSIS
+4. CONTACT ANALYSIS
    - Iterates through all frames/models
    - Calculates pairwise distances between protein and peptide atoms
    - Identifies contacts below the specified cutoff distance
    - Counts unique residue-residue contacts per frame
    - Normalizes by total frames to get contact frequency
 
-4. RESIDUE IDENTIFICATION
+5. RESIDUE IDENTIFICATION
    - Generates unique identifiers: ChainID_ResidueNumber_ResidueType
    - Optionally sorts residues from N-terminus to C-terminus
    - Handles chain separations and multiple segments
 
-5. MATRIX GENERATION
+6. MATRIX GENERATION
    - Creates pivot table with protein residues as rows, peptides as columns
    - Values represent contact frequencies (0.0 to 1.0)
    - Generates row and column-normalized versions
    - Filters data based on user-specified threshold
 
-6. VISUALIZATION
+7. VISUALIZATION
    - Generates heatmaps showing contact patterns
    - Creates bar plots for residue-level analysis
-   - Produces histograms for energy distributions
+   - For OpenMM: Creates energy distribution plots
    - Supports multiple image formats (PNG, PDF, SVG, JPG)
 
-7. DLG ANALYSIS (Optional)
-   - Parses AutoDock CrankPep DLG (Docking Log) files
-   - Extracts ADCP clustering data and affinities
-   - Extracts OMM (OpenMM) rescoring results
-   - Maps OMM data to ADCP clusters using adcp_rank column
-   - Generates sorted energy visualizations
-   - Provides comprehensive energy statistics
-
-8. MONOMER ANALYSIS (Optional)
-   - For multimeric proteins, aggregates contacts per monomer unit
-   - Sums contact frequencies across all monomer copies
-   - Generates separate monomer interaction heatmap
+8. MEMORY OPTIMIZATION (OpenMM mode)
+   - Uses temporary files for each model to minimize memory usage
+   - Processes models sequentially rather than loading all at once
+   - Cleans up temporary files after analysis
 
 ================================================================================
                                     DATA FORMAT
@@ -1595,6 +2137,13 @@ Each XLSX file may contain multiple sheets for organized data presentation.
 
 Basic contact analysis:
   python crankpep_analysis.py -p protein.pdb -l peptide.pdb -c 4.0 -o results
+
+OpenMM rescored analysis:
+  python crankpep_analysis.py --openmm-rescored-pdb openmm_results.pdb -c 4.0 -o openmm_analysis
+
+OpenMM with custom energy cutoff:
+  python crankpep_analysis.py --openmm-rescored-pdb openmm_results.pdb \\
+    --openmm-max-de -10.0 -o favorable_contacts
 
 With DLG file analysis:
   python crankpep_analysis.py --dlg docking.dlg -p protein.pdb \\
@@ -1664,82 +2213,196 @@ Analysis Date: {analysis_date}
     
     return readme_path
 
+
 def main():
     """Main entry point."""
     args = ArgumentParser.parse_arguments()
     
-    if not args.protein or not args.ligand:
-        print("ERROR: Both --protein and --ligand are required", file=sys.stderr)
-        sys.exit(1)
-    
-    # Validate monomer parameters
-    if args.num_monomers > 1 and args.aa_per_monomer is None:
-        print("ERROR: --aa-per-monomer is required when --num-monomers > 1", file=sys.stderr)
-        sys.exit(1)
-    
-    FileValidator.validate_files(args.protein, args.ligand, args.dlg)
-    
-    prot_sel = ResidueHandler.parse_residue_range(args.prot_sel)
-    pep_sel = ResidueHandler.parse_residue_range(args.pep_sel)
-    
-    output_dir = FileValidator.create_output_directory(args.protein, args.ligand, args.dlg)
-    args.output = os.path.join(output_dir, args.output)
-    
-    # Get current timestamp
-    analysis_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    if args.verbose:
-        print(f"Output directory: {output_dir}")
-        print(f"Analysis timestamp: {analysis_date}")
-    
-    # Parse DLG if provided
-    dlg_data = None
-    if args.dlg:
-        parser = DLGParser(args.dlg, args.verbose)
-        dlg_data = parser.parse(args.max_models)
-        DLGPlotter.plot_histogram(dlg_data, args.output, args.dpi, args.verbose)
-        DLGPlotter.plot_cluster_analysis(dlg_data, args.output, args.dpi, args.verbose)
-        DLGPlotter.plot_sorted_omm_interaction_energy(dlg_data, args.output, args.dpi, args.verbose)
-        DLGPlotter.plot_sorted_omm_dE_interaction(dlg_data, args.output, args.dpi, args.verbose)
-    
-    # Analyze contacts
-    analyzer = ContactAnalyzer(
-        args.protein, args.ligand, args.cutoff, prot_sel, pep_sel,
-        args.verbose, args.max_models, args.sort_residues
-    )
-    contact_counter, prot_atoms, pep_atoms, total_frames, prot_res_set, pep_res_set, protein_res_freq, peptide_res_freq = analyzer.analyze()
-    
-    # Create matrices
-    matrix, df, row_norm, col_norm = ContactMatrixBuilder.create_matrix(
-        contact_counter, prot_res_set, pep_res_set, args.output, total_frames, 100
-    )
-    
-    # Generate plots
-    if not args.no_plot:
-        heatmap_file, filtered_file, filtered_matrix = HeatmapPlotter.plot(
-            matrix, args.output, args.heatmap_format, args.dpi, args.cutoff,
-            args.horizontal, args.threshold, 12, 8
+    # Validate based on input type
+    if hasattr(args, 'openmm_rescored_pdb') and args.openmm_rescored_pdb:
+        # OpenMM analysis mode
+        if args.verbose:
+            print("Running OpenMM rescored PDB analysis mode")
+        
+        FileValidator.validate_files(openmm_file=args.openmm_rescored_pdb)
+        
+        prot_sel = ResidueHandler.parse_residue_range(args.prot_sel)
+        pep_sel = ResidueHandler.parse_residue_range(args.pep_sel)
+        
+        output_dir = FileValidator.create_output_directory(openmm_file=args.openmm_rescored_pdb)
+        args.output = os.path.join(output_dir, args.output)
+        
+        # Get current timestamp
+        analysis_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if args.verbose:
+            print(f"Output directory: {output_dir}")
+            print(f"Analysis timestamp: {analysis_date}")
+            print(f"Maximum dE_Interaction: {args.openmm_max_de}")
+        
+        # Analyze OpenMM rescored PDB
+        analyzer = OpenMMRescoredPDBAnalyzer(
+            args.openmm_rescored_pdb, args.cutoff, prot_sel, pep_sel,
+            args.verbose, args.max_models, args.sort_residues, args.openmm_max_de
         )
         
-        if filtered_matrix is not None and not filtered_matrix.empty:
-            BarplotPlotter.plot_peptide(filtered_matrix, args.output, args.heatmap_format, args.dpi, args.horizontal, total_frames)
-            BarplotPlotter.plot_protein(filtered_matrix, args.output, args.heatmap_format, args.dpi, args.horizontal, total_frames)
+        # Parse and analyze
+        contact_counter, prot_atoms, pep_atoms, total_frames, prot_res_set, pep_res_set, protein_res_freq, peptide_res_freq = analyzer.analyze_contacts()
         
-        if args.num_monomers > 1 and args.aa_per_monomer is not None:
-            MonomericInteractionPlotter.create_heatmap(
-                filtered_matrix, args.num_monomers, args.aa_per_monomer,
-                args.output, args.heatmap_format, args.dpi, 12, 10, args.verbose
+        if not contact_counter:
+            print(f"\nERROR: No contacts found in {total_frames} models!", file=sys.stderr)
+            print(f"Possible issues:", file=sys.stderr)
+            print(f"1. Check distance cutoff (current: {args.cutoff} Å)", file=sys.stderr)
+            print(f"2. Check atom selections (protein: '{prot_sel}', peptide: '{pep_sel}')", file=sys.stderr)
+            print(f"3. Protein and peptide might be too far apart", file=sys.stderr)
+            sys.exit(1)
+        
+        # Get energy statistics
+        energy_df = analyzer.get_energy_statistics()
+        if not energy_df.empty:
+            energy_output = f"{args.output}_openmm_energies.xlsx"
+            energy_df.to_excel(energy_output, index=False, engine='openpyxl')
+            if args.verbose:
+                print(f"Saved OpenMM energy data to: {energy_output}")
+        
+        # Create matrices
+        matrix, df, row_norm, col_norm = ContactMatrixBuilder.create_matrix(
+            contact_counter, prot_res_set, pep_res_set, args.output, total_frames, 100
+        )
+        
+        if args.verbose:
+            print(f"Contact matrix dimensions: {matrix.shape[0]} x {matrix.shape[1]}")
+            print(f"Total contact pairs: {len(df)}")
+        
+        # Generate plots
+        if not args.no_plot:
+            # Regular heatmaps
+            heatmap_file, filtered_file, filtered_matrix = HeatmapPlotter.plot(
+                matrix, args.output, args.heatmap_format, args.dpi, args.cutoff,
+                args.horizontal, args.threshold, 12, 8
             )
+            
+            if filtered_matrix is not None and not filtered_matrix.empty:
+                BarplotPlotter.plot_peptide(filtered_matrix, args.output, 
+                                          args.heatmap_format, args.dpi, 
+                                          args.horizontal, total_frames)
+                BarplotPlotter.plot_protein(filtered_matrix, args.output, 
+                                          args.heatmap_format, args.dpi, 
+                                          args.horizontal, total_frames)
+            
+            # OpenMM energy plots
+            if not energy_df.empty:
+                OpenMMEnergyPlotter.plot_energy_distributions(
+                    energy_df, args.output, args.dpi, args.verbose
+                )
+            
+            # Top models contacts (save to Excel)
+            if hasattr(args, 'openmm_top_models') and args.openmm_top_models > 0:
+                OpenMMEnergyPlotter.plot_top_models_contacts(
+                    contact_counter, args.openmm_top_models, args.output,
+                    prot_res_set, pep_res_set, total_frames,
+                    args.heatmap_format, args.dpi, args.verbose
+                )
+            
+            # Monomer analysis if requested
+            if args.num_monomers > 1:
+                if args.aa_per_monomer is None:
+                    print("ERROR: --aa-per-monomer is required when --num-monomers > 1", file=sys.stderr)
+                    sys.exit(1)
+                
+                # Check if we have a filtered matrix to work with
+                if filtered_matrix is not None and not filtered_matrix.empty:
+                    MonomericInteractionPlotter.create_heatmap(
+                        filtered_matrix, args.num_monomers, args.aa_per_monomer,
+                        args.output, args.heatmap_format, args.dpi, 12, 10, args.verbose
+                    )
+                else:
+                    print(f"WARNING: Cannot create monomer heatmap - filtered matrix is empty.")
+        
+        # Create README file
+        readme_file = create_readme_file(output_dir, analysis_date, args, total_frames, len(df))
+        
+        # Print summary
+        SummaryPrinter.print_summary(df, matrix, args.output, total_frames, args)
+        
+        if args.verbose:
+            print(f"README file created: {readme_file}")
+            print("OpenMM analysis complete!")
     
-    # Create README file
-    readme_file = create_readme_file(output_dir, analysis_date, args, total_frames, len(df))
-    
-    # Print summary
-    SummaryPrinter.print_summary(df, matrix, args.output, total_frames, args)
-    
-    if args.verbose:
-        print(f"README file created: {readme_file}")
-        print("Analysis complete!")
+    else:
+        # Original analysis mode (with protein and ligand files)
+        if not args.protein or not args.ligand:
+            print("ERROR: Both --protein and --ligand are required for regular analysis", file=sys.stderr)
+            sys.exit(1)
+        
+        # Validate monomer parameters
+        if args.num_monomers > 1 and args.aa_per_monomer is None:
+            print("ERROR: --aa-per-monomer is required when --num-monomers > 1", file=sys.stderr)
+            sys.exit(1)
+        
+        FileValidator.validate_files(args.protein, args.ligand, args.dlg)
+        
+        prot_sel = ResidueHandler.parse_residue_range(args.prot_sel)
+        pep_sel = ResidueHandler.parse_residue_range(args.pep_sel)
+        
+        output_dir = FileValidator.create_output_directory(args.protein, args.ligand, args.dlg)
+        args.output = os.path.join(output_dir, args.output)
+        
+        # Get current timestamp
+        analysis_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if args.verbose:
+            print(f"Output directory: {output_dir}")
+            print(f"Analysis timestamp: {analysis_date}")
+        
+        # Parse DLG if provided
+        dlg_data = None
+        if args.dlg:
+            parser = DLGParser(args.dlg, args.verbose)
+            dlg_data = parser.parse(args.max_models)
+            DLGPlotter.plot_histogram(dlg_data, args.output, args.dpi, args.verbose)
+            DLGPlotter.plot_cluster_analysis(dlg_data, args.output, args.dpi, args.verbose)
+            DLGPlotter.plot_sorted_omm_interaction_energy(dlg_data, args.output, args.dpi, args.verbose)
+            DLGPlotter.plot_sorted_omm_dE_interaction(dlg_data, args.output, args.dpi, args.verbose)
+        
+        # Analyze contacts
+        analyzer = ContactAnalyzer(
+            args.protein, args.ligand, args.cutoff, prot_sel, pep_sel,
+            args.verbose, args.max_models, args.sort_residues
+        )
+        contact_counter, prot_atoms, pep_atoms, total_frames, prot_res_set, pep_res_set, protein_res_freq, peptide_res_freq = analyzer.analyze()
+        
+        # Create matrices
+        matrix, df, row_norm, col_norm = ContactMatrixBuilder.create_matrix(
+            contact_counter, prot_res_set, pep_res_set, args.output, total_frames, 100
+        )
+        
+        # Generate plots
+        if not args.no_plot:
+            heatmap_file, filtered_file, filtered_matrix = HeatmapPlotter.plot(
+                matrix, args.output, args.heatmap_format, args.dpi, args.cutoff,
+                args.horizontal, args.threshold, 12, 8
+            )
+            
+            if filtered_matrix is not None and not filtered_matrix.empty:
+                BarplotPlotter.plot_peptide(filtered_matrix, args.output, args.heatmap_format, args.dpi, args.horizontal, total_frames)
+                BarplotPlotter.plot_protein(filtered_matrix, args.output, args.heatmap_format, args.dpi, args.horizontal, total_frames)
+            
+            if args.num_monomers > 1 and args.aa_per_monomer is not None:
+                MonomericInteractionPlotter.create_heatmap(
+                    filtered_matrix, args.num_monomers, args.aa_per_monomer,
+                    args.output, args.heatmap_format, args.dpi, 12, 10, args.verbose
+                )
+        
+        # Create README file
+        readme_file = create_readme_file(output_dir, analysis_date, args, total_frames, len(df))
+        
+        # Print summary
+        SummaryPrinter.print_summary(df, matrix, args.output, total_frames, args)
+        
+        if args.verbose:
+            print(f"README file created: {readme_file}")
+            print("Analysis complete!")
 
 
 if __name__ == "__main__":
