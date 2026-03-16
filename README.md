@@ -131,16 +131,7 @@ This tool provides contact frequency analysis, energy rescoring visualization, a
 
 ## Data Format
 
-All data files are saved in **XLSX (Excel)** format for maximum compatibility:
-
-✓ Microsoft Excel  
-✓ LibreOffice Calc  
-✓ Python `pandas` (`pd.read_excel()`)  
-✓ R `readxl` package  
-✓ Other data analysis tools  
-
-Each XLSX file contains multiple sheets for organized data presentation.
-
+All data files are saved in **XLSX (Excel)** format
 ---
 
 ## Command-Line Reference
@@ -184,20 +175,20 @@ options:
 
 ## Usage Examples
 
-### ⚙️ Basic Contact Analysis
+### Basic Analysis
 
 ```bash
 python crankpep_analysis.py -p protein.pdb -l peptide.pdb -c 4.0 -o results
 ```
 
-### ⚙️ With DLG File Analysis
+### With DLG File
 
 ```bash
 python crankpep_analysis.py --dlg docking.dlg -p protein.pdb \
   -l ligand_poses.pdb -c 4.0 -o dlg_analysis
 ```
 
-### ⚙️ With Custom Selections and Filtering
+### With Custom Selections and Filtering
 
 ```bash
 python crankpep_analysis.py -p protein.pdb -l peptide.pdb \
@@ -206,7 +197,7 @@ python crankpep_analysis.py -p protein.pdb -l peptide.pdb \
   --threshold 0.1 -o filtered_results
 ```
 
-### ⚙️ With Monomer Analysis
+### With Monomer Recalculation
 
 ```bash
 python crankpep_analysis.py -p tetramer.pdb -l peptide.pdb \
