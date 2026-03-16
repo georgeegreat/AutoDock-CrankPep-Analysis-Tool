@@ -1,14 +1,14 @@
 # AutoDock CrankPep Analysis Tool
 
-A comprehensive Python script for visualization and analysis of protein-peptide interactions from AutoDock CrankPep docking results, with data preparation capabilities for downstream processing.
+Python scripts for visualization and analysis of protein-peptide interactions from AutoDock CrankPep docking results, with data preparation capabilities for downstream processing.
 
 ---
 
 ## Overview
 
-This tool provides extensive contact frequency analysis, energy rescoring visualization, and multi-format data export for AutoDock CrankPep docking campaigns. It processes molecular dynamics trajectories or docking pose ensembles to identify and quantify protein-peptide interactions.
+This tool provides contact frequency analysis, energy rescoring visualization, and multi-format data export for AutoDock CrankPep docking results. It processes molecular dynamics trajectories or docking pose ensembles to identify and quantify protein-peptide interactions.
 
-> **Note:** The term "frame" refers to a representative structure from a cluster of docked poses in the PDB output from CrankPep. These clusters are formed after AutoDock CrankPep's own clustering procedure.
+> **Note:** The term "frame" refers to a representative structure from a cluster of docked poses in the PDB output from CrankPep. These clusters are formed after AutoDock CrankPep's own clustering procedure, but such "frames", if provided in acceptable format, could also be from MD trajectories (although this was not yet tested)
 
 ---
 
