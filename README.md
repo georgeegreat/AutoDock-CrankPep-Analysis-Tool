@@ -204,7 +204,7 @@ python crankpep_analysis.py -p tetramer.pdb -l peptide.pdb \
   --num-monomers 4 -o monomer_analysis
 ```
 
-### ⚙️ Verbose Output with Custom Format
+### Verbose Output with Custom Format
 
 ```bash
 python crankpep_analysis.py -p protein.pdb -l peptide.pdb -v \
