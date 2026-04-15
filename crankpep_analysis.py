@@ -173,33 +173,24 @@ class OpenMMRescoredPDBAnalyzer:
             elif line.startswith('ATOM') or line.startswith('HETATM'):
                 if current_model is not None:
                     # Determine if this is protein or peptide based on chain ID
-                    # Protein is chain 'd', peptide is chain 'Z'
+                    # Peptide is ALWAYS chain 'Z', protein is any other chain
                     if len(line) >= 22:
                         chain_id = line[21]
-                        if chain_id == 'd' or chain_id == 'D':
-                            current_model['protein_lines'].append(line)
-                            if not in_protein:
-                                in_protein = True
-                        elif chain_id == 'Z' or chain_id == 'z':
+                        if chain_id == 'Z' or chain_id == 'z':
+                            # Peptide chain
                             current_model['peptide_lines'].append(line)
-                            if not in_peptide:
-                                in_peptide = True
+                            in_peptide = True
                         else:
-                            # Default: assume first chain is protein, second is peptide
-                            if not in_peptide:
-                                current_model['protein_lines'].append(line)
-                                in_protein = True
-                            else:
-                                current_model['peptide_lines'].append(line)
+                            # Protein chain (everything else: d, D, A, B, C, etc.)
+                            current_model['protein_lines'].append(line)
+                            in_protein = True
             
             elif line.startswith('TER'):
                 if current_model is not None:
-                    # Mark transition from protein to peptide
-                    if in_protein and not in_peptide:
+                    # Add TER to both protein and peptide sections (they manage their own TER records)
+                    if in_protein:
                         current_model['protein_lines'].append(line)
-                        in_peptide = True
-                        in_protein = False
-                    elif in_peptide:
+                    if in_peptide:
                         current_model['peptide_lines'].append(line)
             
             elif line.startswith('ENDMDL'):
